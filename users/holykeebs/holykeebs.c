@@ -1,0 +1,1237 @@
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "holykeebs.h"
+
+#include "eeconfig.h"
+#include "pointing_device.h"
+#include "report.h"
+#include "color.h"
+
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+#include "pointing_device_auto_mouse.h"
+#endif
+
+#include "pointing.h"
+#include "pimoroni.h"
+#include "trackpoint.h"
+#include "hk_debug.h"
+#include "eeprom_config.h"
+
+#if defined(HK_SPLIT_SYNC_STATE) || defined(HK_SPLIT_DETECT_POINTING)
+#include "rpc.h"
+#include "transactions.h"
+#endif
+
+#if (defined(HK_POINTING_DEVICE_LEFT_TRACKPOINT) || defined(HK_POINTING_DEVICE_RIGHT_TRACKPOINT)) && defined(OLED_ENABLE)
+// I2C1_SDA_PAL_MODE / I2C1_SCL_PAL_MODE for the PS/2-failure pin restore below.
+#include "chibios_config.h"
+#endif
+
+#define _CONSTRAIN(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
+#define CONSTRAIN_XY(val)      (mouse_xy_report_t) _CONSTRAIN(val, MOUSE_REPORT_XY_MIN, MOUSE_REPORT_XY_MAX)
+#define CONSTRAIN_HV(val)      (mouse_hv_report_t) _CONSTRAIN(val, MOUSE_REPORT_HV_MIN, MOUSE_REPORT_HV_MAX)
+
+static const char BL = '\xB0'; // Blank indicator character
+
+hk_state_t g_hk_state = {0};
+hk_eeprom_config_t hk_eeprom_config;
+
+// The pointer_*_sensitivity fields are intentionally overloaded: a software
+// movement multiplier for most devices, the raw hardware CPI for sensors that
+// scale in hardware (PMW3360). The realization is derived from the kind, so no
+// extra stored field is needed.
+static bool uses_hw_cpi(hk_pointer_kind kind) {
+    return kind == POINTER_KIND_PMW3360;
+}
+
+// The int16 EEPROM sensitivity field stores software multipliers ×100 (1.25 ->
+// 125) so the fractional step survives the round-trip, but raw CPI for
+// hardware-CPI devices (800 -> 800). Branch per kind on (de)serialize.
+static float deserialize_sensitivity(hk_pointer_kind kind, int16_t raw) {
+    return uses_hw_cpi(kind) ? (float)raw : raw / 100.0;
+}
+
+static int16_t serialize_sensitivity(hk_pointer_kind kind, float value) {
+    return uses_hw_cpi(kind) ? (int16_t)value : (int16_t)(value * 100);
+}
+
+// Defined below; forward-declared because hk_set_cursor_mode (above its
+// definition) re-applies the CPI when sniping toggles.
+static void hk_apply_sensitivity(const hk_pointer_state_t* state, bool side_peripheral);
+
+// Defined below; forward-declared for init_state.
+static bool hk_active_side_peripheral(void);
+
+// A sensitivity of 0 multiplies that side's motion to nothing (scale_movement),
+// so the pointer still clicks and scrolls but never moves - invisible from the
+// outside and hard to trace back to a setting. The schema version and the kind
+// check should keep one from ever being loaded; take the default this
+// configuration computed rather than trust that. A side with no device keeps its
+// 0, which nothing reads.
+static float validated_sensitivity(hk_pointer_kind kind, float stored, float fallback) {
+    if (kind == POINTER_KIND_NONE || stored > 0) {
+        return stored;
+    }
+    printf("deserialize_eeconfig_to_state: ignoring a stored sensitivity of 0 for a %s, using %.2f\n", hk_pointer_kind_to_string(kind), fallback);
+    return fallback;
+}
+
+// Called with g_hk_state holding init_state's values, so they double as the
+// fallback for anything stored that can't be right.
+static void deserialize_eeconfig_to_state(const hk_eeprom_config_t* config) {
+    const hk_pointer_state_t main_defaults = g_hk_state.main;
+    const hk_pointer_state_t peripheral_defaults = g_hk_state.peripheral;
+
+    g_hk_state.display.show_bongo_main = config->bongo_main;
+    g_hk_state.display.show_bongo_peripheral = config->bongo_peripheral;
+
+    g_hk_state.main.cursor_mode = config->pointing.main_cursor_mode;
+    g_hk_state.main.drag_scroll = config->pointing.main_drag_scroll;
+    g_hk_state.main.scroll_lock = config->pointing.main_scroll_lock;
+    g_hk_state.main.scroll_direction_inverted = config->pointing.main_scroll_direction_inverted;
+    g_hk_state.main.pointer_default_sensitivity = validated_sensitivity(main_defaults.pointer_kind, deserialize_sensitivity(main_defaults.pointer_kind, config->pointing.main_default_sensitivity), main_defaults.pointer_default_sensitivity);
+    g_hk_state.main.pointer_sniping_sensitivity = validated_sensitivity(main_defaults.pointer_kind, deserialize_sensitivity(main_defaults.pointer_kind, config->pointing.main_sniping_sensitivity), main_defaults.pointer_sniping_sensitivity);
+    g_hk_state.main.pointer_scroll_throttle = config->pointing.main_scroll_throttle;
+
+    g_hk_state.peripheral.cursor_mode = config->pointing.peripheral_cursor_mode;
+    g_hk_state.peripheral.drag_scroll = config->pointing.peripheral_drag_scroll;
+    g_hk_state.peripheral.scroll_lock = config->pointing.peripheral_scroll_lock;
+    g_hk_state.peripheral.scroll_direction_inverted = config->pointing.peripheral_scroll_direction_inverted;
+    g_hk_state.peripheral.pointer_default_sensitivity = validated_sensitivity(peripheral_defaults.pointer_kind, deserialize_sensitivity(peripheral_defaults.pointer_kind, config->pointing.peripheral_default_sensitivity), peripheral_defaults.pointer_default_sensitivity);
+    g_hk_state.peripheral.pointer_sniping_sensitivity = validated_sensitivity(peripheral_defaults.pointer_kind, deserialize_sensitivity(peripheral_defaults.pointer_kind, config->pointing.peripheral_sniping_sensitivity), peripheral_defaults.pointer_sniping_sensitivity);
+    g_hk_state.peripheral.pointer_scroll_throttle = config->pointing.peripheral_scroll_throttle;
+}
+
+static void serialize_state_to_eeconfig(hk_eeprom_config_t* config) {
+    config->bongo_main = g_hk_state.display.show_bongo_main;
+    config->bongo_peripheral = g_hk_state.display.show_bongo_peripheral;
+
+    config->pointing.main_pointer_kind = g_hk_state.main.pointer_kind;
+    config->pointing.peripheral_pointer_kind = g_hk_state.peripheral.pointer_kind;
+
+    config->pointing.main_cursor_mode = g_hk_state.main.cursor_mode;
+    config->pointing.main_drag_scroll = g_hk_state.main.drag_scroll;
+    config->pointing.main_scroll_lock = g_hk_state.main.scroll_lock;
+    config->pointing.main_scroll_direction_inverted = g_hk_state.main.scroll_direction_inverted;
+    config->pointing.main_default_sensitivity = serialize_sensitivity(g_hk_state.main.pointer_kind, g_hk_state.main.pointer_default_sensitivity);
+    config->pointing.main_sniping_sensitivity = serialize_sensitivity(g_hk_state.main.pointer_kind, g_hk_state.main.pointer_sniping_sensitivity);
+    config->pointing.main_scroll_throttle = g_hk_state.main.pointer_scroll_throttle;
+
+    config->pointing.peripheral_cursor_mode = g_hk_state.peripheral.cursor_mode;
+    config->pointing.peripheral_drag_scroll = g_hk_state.peripheral.drag_scroll;
+    config->pointing.peripheral_scroll_lock = g_hk_state.peripheral.scroll_lock;
+    config->pointing.peripheral_scroll_direction_inverted = g_hk_state.peripheral.scroll_direction_inverted;
+    config->pointing.peripheral_default_sensitivity = serialize_sensitivity(g_hk_state.peripheral.pointer_kind, g_hk_state.peripheral.pointer_default_sensitivity);
+    config->pointing.peripheral_sniping_sensitivity = serialize_sensitivity(g_hk_state.peripheral.pointer_kind, g_hk_state.peripheral.pointer_sniping_sensitivity);
+    config->pointing.peripheral_scroll_throttle = g_hk_state.peripheral.pointer_scroll_throttle;
+
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+    // Auto-mouse state lives in QMK's auto_mouse, not g_hk_state, so read it from
+    // there directly.
+    config->aml_enable = get_auto_mouse_enable();
+    config->aml_timeout = get_auto_mouse_timeout();
+#endif
+}
+
+static void write_eeconfig(void) {
+    serialize_state_to_eeconfig(&hk_eeprom_config);
+    eeconfig_update_user_datablock(&hk_eeprom_config, 0, sizeof(hk_eeprom_config_t));
+
+    printf("write_eeconfig: eeprom data written\n");
+}
+
+static void hk_configure_tps65_common(hk_pointer_state_t* state) {
+    state->pointer_default_sensitivity = 1.25;
+    state->pointer_sniping_sensitivity = 1.0;
+    state->pointer_scroll_throttle = 5;
+}
+
+static void hk_configure_tps43_common(hk_pointer_state_t* state) {
+    state->pointer_default_sensitivity = 1.25;
+    state->pointer_sniping_sensitivity = 1.0;
+    state->pointer_scroll_throttle = 5;
+}
+
+static void hk_configure_pimoroni_common(hk_pointer_state_t* state) {
+    state->pointer_default_sensitivity = 1.5;
+    state->pointer_sniping_sensitivity = 1.0;
+    state->pointer_scroll_throttle = 1;
+}
+
+static void hk_configure_trackpoint_common(hk_pointer_state_t* state) {
+    state->pointer_default_sensitivity = 2.0;
+    state->pointer_sniping_sensitivity = 1.0;
+    state->pointer_scroll_throttle = 5;
+}
+
+static void hk_configure_cirque_common(hk_pointer_state_t* state) {
+    state->pointer_default_sensitivity = 1.0;
+    state->pointer_sniping_sensitivity = 1.0;
+}
+
+static void hk_configure_pmw3360_common(hk_pointer_state_t* state) {
+    // PMW3360 sensitivity is realized as hardware CPI (see hk_apply_sensitivity),
+    // so these values are raw CPI, not a software multiplier.
+    state->pointer_default_sensitivity = 800;
+    state->pointer_sniping_sensitivity = 400;
+    state->pointer_scroll_throttle = 8;
+}
+
+static hk_state_t init_state(void) {
+    printf("init_state\n");
+    hk_state_t state = {
+        .init = true,
+        .dirty = false,
+        .is_main_side = is_keyboard_master(),
+        .setting_default_sensitivity = false,
+        .setting_sniping_sensitivity = false,
+        .setting_scroll_throttle = false,
+        .active_is_peripheral = false,
+        .main = {
+            .pointer_kind = POINTER_KIND_NONE,
+            .cursor_mode = CURSOR_MODE_DEFAULT,
+            .drag_scroll = false,
+            .scroll_lock = SCROLL_LOCK_OFF,
+            .scroll_direction_inverted = false,
+            .pointer_default_sensitivity = 0,
+            .pointer_sniping_sensitivity = 0,
+            .pointer_scroll_throttle = 0,
+        },
+        .peripheral = {
+            .pointer_kind = POINTER_KIND_NONE,
+            .cursor_mode = CURSOR_MODE_DEFAULT,
+            .drag_scroll = false,
+            .scroll_lock = SCROLL_LOCK_OFF,
+            .scroll_direction_inverted = false,
+            .pointer_default_sensitivity = 0,
+            .pointer_sniping_sensitivity = 0,
+            .pointer_scroll_throttle = 0,
+        },
+        .display = {
+            // Both OLEDs default to the info panels (the peripheral's is its logo
+            // on boards that override the secondary render). Bongocat is compiled in
+            // by default (see rules.mk) but shown only when toggled on at runtime
+            // with HK_BONGO_TOGGLE; shift targets the peripheral half. Persisted via
+            // HK_SAVE.
+            .show_bongo_main = false,
+            .show_bongo_peripheral = false,
+            .last_kc = KC_NO,
+            .last_pos = {0, 0},
+            .last_mouse = {0, 0, 0, 0, 0},
+            .pressing_keys = { BL, BL, BL, BL, BL, BL, 0 },
+        },
+    };
+
+    if (!state.is_main_side) {
+        return state;
+    }
+
+    state.active_is_peripheral = hk_active_side_peripheral();
+
+    #if defined(HK_POINTING_DEVICE_MIDDLE_TPS65)
+        state.main.pointer_kind = POINTER_KIND_TPS65;
+    #endif
+
+    #ifdef HK_POINTING_DEVICE_RIGHT_PIMORONI
+        state.main.pointer_kind = POINTER_KIND_PIMORONI_TRACKBALL;
+    #elif defined(HK_POINTING_DEVICE_RIGHT_TRACKPOINT)
+        state.main.pointer_kind = POINTER_KIND_TRACKPOINT;
+    #elif defined(HK_POINTING_DEVICE_RIGHT_CIRQUE35)
+        state.main.pointer_kind = POINTER_KIND_CIRQUE35;
+    #elif defined(HK_POINTING_DEVICE_RIGHT_CIRQUE40)
+        state.main.pointer_kind = POINTER_KIND_CIRQUE40;
+    #elif defined(HK_POINTING_DEVICE_RIGHT_TPS43)
+        state.main.pointer_kind = POINTER_KIND_TPS43;
+    #elif defined(HK_POINTING_DEVICE_RIGHT_PMW3360)
+        state.main.pointer_kind = POINTER_KIND_PMW3360;
+    #endif
+
+    #ifdef HK_POINTING_DEVICE_LEFT_PIMORONI
+        state.peripheral.pointer_kind = POINTER_KIND_PIMORONI_TRACKBALL;
+    #elif defined(HK_POINTING_DEVICE_LEFT_TRACKPOINT)
+        state.peripheral.pointer_kind = POINTER_KIND_TRACKPOINT;
+    #elif defined(HK_POINTING_DEVICE_LEFT_CIRQUE35)
+        state.peripheral.pointer_kind = POINTER_KIND_CIRQUE35;
+    #elif defined(HK_POINTING_DEVICE_LEFT_CIRQUE40)
+        state.peripheral.pointer_kind = POINTER_KIND_CIRQUE40;
+    #elif defined(HK_POINTING_DEVICE_LEFT_TPS43)
+        state.peripheral.pointer_kind = POINTER_KIND_TPS43;
+    #elif defined(HK_POINTING_DEVICE_LEFT_PMW3360)
+        state.peripheral.pointer_kind = POINTER_KIND_PMW3360;
+    #endif
+
+    // TPS65 is only supported for unibody keyboards, so check that to know if we have a split keyboard.
+    if (state.main.pointer_kind != POINTER_KIND_TPS65 && is_keyboard_left()) {
+        printf("init_state: left hand, swapping main and peripheral pointers\n");
+        hk_pointer_kind temp = state.main.pointer_kind;
+        state.main.pointer_kind = state.peripheral.pointer_kind;
+        state.peripheral.pointer_kind = temp;
+    }
+
+    switch (state.main.pointer_kind) {
+        case POINTER_KIND_TRACKPOINT:
+            hk_configure_trackpoint_common(&state.main);
+            break;
+        case POINTER_KIND_CIRQUE35:
+        case POINTER_KIND_CIRQUE40:
+            hk_configure_cirque_common(&state.main);
+            break;
+        case POINTER_KIND_TPS43:
+            hk_configure_tps43_common(&state.main);
+            break;
+        case POINTER_KIND_TPS65:
+            hk_configure_tps65_common(&state.main);
+            break;
+        case POINTER_KIND_PIMORONI_TRACKBALL:
+            hk_configure_pimoroni_common(&state.main);
+            break;
+        case POINTER_KIND_PMW3360:
+            hk_configure_pmw3360_common(&state.main);
+            break;
+        default:
+            printf("init_state: unknown main pointer kind\n");
+            break;
+    }
+
+    // Overrides the defaults for the case where the desired value is already known by the user. This only gets set
+    // if there's nothing saved in eeprom.
+    if (state.main.pointer_kind) {
+        #ifdef HK_MAIN_DEFAULT_POINTER_DEFAULT_SENSITIVITY
+            state.main.pointer_default_sensitivity = HK_MAIN_DEFAULT_POINTER_DEFAULT_SENSITIVITY;
+        #endif
+        #ifdef HK_MAIN_DEFAULT_POINTER_SNIPING_SENSITIVITY
+            state.main.pointer_sniping_sensitivity = HK_MAIN_DEFAULT_POINTER_SNIPING_SENSITIVITY;
+        #endif
+        #ifdef HK_MAIN_DEFAULT_POINTER_SCROLL_THROTTLE
+            state.main.pointer_scroll_throttle = HK_MAIN_DEFAULT_POINTER_SCROLL_THROTTLE;
+        #endif
+    }
+
+    if (state.peripheral.pointer_kind != POINTER_KIND_NONE) {
+        switch (state.peripheral.pointer_kind) {
+            case POINTER_KIND_TRACKPOINT:
+                hk_configure_trackpoint_common(&state.peripheral);
+                break;
+            case POINTER_KIND_CIRQUE35:
+            case POINTER_KIND_CIRQUE40:
+                hk_configure_cirque_common(&state.peripheral);
+                break;
+            case POINTER_KIND_TPS43:
+                hk_configure_tps43_common(&state.peripheral);
+                break;
+            case POINTER_KIND_PIMORONI_TRACKBALL:
+                hk_configure_pimoroni_common(&state.peripheral);
+                state.peripheral.drag_scroll = true;
+                break;
+            case POINTER_KIND_PMW3360:
+                hk_configure_pmw3360_common(&state.peripheral);
+                break;
+            default:
+                printf("init_state: unknown peripheral pointer kind\n");
+                break;
+        }
+
+        // Overrides the defaults for the case where the desired value is already known by the user. This only gets set
+        // if there's nothing saved in eeprom.
+        #ifdef HK_PERIPHERAL_DEFAULT_POINTER_DEFAULT_SENSITIVITY
+            state.peripheral.pointer_default_sensitivity = HK_PERIPHERAL_DEFAULT_POINTER_DEFAULT_SENSITIVITY;
+        #endif
+        #ifdef HK_PERIPHERAL_DEFAULT_POINTER_SNIPING_SENSITIVITY
+            state.peripheral.pointer_sniping_sensitivity = HK_PERIPHERAL_DEFAULT_POINTER_SNIPING_SENSITIVITY;
+        #endif
+        #ifdef HK_PERIPHERAL_DEFAULT_POINTER_SCROLL_THROTTLE
+            state.peripheral.pointer_scroll_throttle = HK_PERIPHERAL_DEFAULT_POINTER_SCROLL_THROTTLE;
+        #endif
+    }
+
+    return state;
+}
+
+static bool has_shift_mod(void) {
+#        ifdef NO_ACTION_ONESHOT
+    return mod_config(get_mods()) & MOD_MASK_SHIFT;
+#        else
+    return mod_config(get_mods() | get_oneshot_mods()) & MOD_MASK_SHIFT;
+#        endif // NO_ACTION_ONESHOT
+}
+
+// Which half's pointer state the unshifted config keycodes (and the OLED
+// pointer panel) act on. Normally the master's: the modular boards pin the
+// master to the pointing-device half, so the master's device is always the
+// one in use, and shift selects the peripheral's.
+//
+// Boards that detect their ball(s) at runtime (HK_SPLIT_DETECT_POINTING) let
+// USB go in either half, so the master may have no ball while the peripheral
+// does — a keyball61plus plugged in on the ball-less half. The master's state
+// then belongs to a device that isn't there, and every unshifted keycode
+// (drag scroll, sniping, sensitivity...) silently configured that nothing.
+// So on those boards the half with no local device hands the default target
+// to the other half, and shift selects this (empty) one instead — the
+// convention stays "shift = the other half" whichever half USB is in.
+//
+// Followed live (housekeeping) rather than fixed at init: the local sensor may
+// only come up on a retry after boot.
+static bool hk_active_side_peripheral(void) {
+#ifdef HK_SPLIT_DETECT_POINTING
+    return !hk_local_pointing_present();
+#else
+    return false;
+#endif
+}
+
+#ifdef HK_SPLIT_DETECT_POINTING
+// Master-only. Re-evaluates the default target and syncs it to the peripheral
+// when it changes.
+static void hk_update_active_side(void) {
+    bool peripheral = hk_active_side_peripheral();
+    if (g_hk_state.active_is_peripheral != peripheral) {
+        printf("hk_update_active_side: config keycodes now target the %s half\n", peripheral ? "peripheral" : "main");
+        g_hk_state.active_is_peripheral = peripheral;
+        g_hk_state.dirty = true;
+    }
+}
+#endif
+
+// The half a config keycode targets: the active side by default, the other
+// one with shift held.
+static bool hk_target_side_peripheral(void) {
+    return has_shift_mod() != g_hk_state.active_is_peripheral;
+}
+
+__attribute__((weak)) report_mouse_t pointing_device_task_keymap(report_mouse_t mouse_report) {
+    return mouse_report;
+}
+
+__attribute__((weak)) report_mouse_t pointing_device_task_combined_keymap(report_mouse_t mouse_report) {
+    return mouse_report;
+}
+
+__attribute__((weak)) bool process_record_keymap(uint16_t keycode, keyrecord_t* record) {
+    return true;
+}
+
+// Perform scroll related functionality: drag scrolling, scroll lock.
+void hk_process_scroll(const hk_pointer_state_t* pointer_state, report_mouse_t* mouse_report) {
+    if (pointer_state->drag_scroll) {
+        mouse_report->h = mouse_report->x;
+        mouse_report->v = mouse_report->y;
+        mouse_report->x = 0;
+        mouse_report->y = 0;
+    }
+
+    if (pointer_state->scroll_direction_inverted) {
+        mouse_report->h = -mouse_report->h;
+        mouse_report->v = -mouse_report->v;
+    }
+
+    if (pointer_state->pointer_scroll_throttle > 0) {
+#ifdef POINTING_DEVICE_HIRES_SCROLL_ENABLE
+        // Hires emits sub-line values that the OS smooths, so the threshold
+        // buffer (originally a debounce for coarse ±1 line scrolls) is dropped.
+        // pointer_scroll_throttle is repurposed as a speed divisor: larger
+        // = slower. One unit of cursor motion → resolution/divisor hires units.
+        const int16_t tick = pointing_device_get_hires_scroll_resolution();
+        mouse_report->h = (mouse_report->h * tick) / pointer_state->pointer_scroll_throttle;
+        mouse_report->v = (mouse_report->v * tick) / pointer_state->pointer_scroll_throttle;
+#else
+        static int16_t scroll_buffer_h = 0;
+        static int16_t scroll_buffer_v = 0;
+
+        scroll_buffer_h += mouse_report->h;
+        scroll_buffer_v += mouse_report->v;
+        mouse_report->h = 0;
+        mouse_report->v = 0;
+
+        if (abs(scroll_buffer_h) > pointer_state->pointer_scroll_throttle) {
+            mouse_report->h = scroll_buffer_h > 0 ? 1 : -1;
+            scroll_buffer_h = 0;
+        }
+
+        if (abs(scroll_buffer_v) > pointer_state->pointer_scroll_throttle) {
+            mouse_report->v = scroll_buffer_v > 0 ? 1 : -1;
+            scroll_buffer_v = 0;
+        }
+#endif
+    }
+
+    mouse_hv_report_t h = mouse_report->h;
+    mouse_hv_report_t v = mouse_report->v;
+    mouse_report->h = 0;
+    mouse_report->v = 0;
+
+    if (pointer_state->scroll_lock == SCROLL_LOCK_HORIZONTAL || pointer_state->scroll_lock == SCROLL_LOCK_OFF) {
+        mouse_report->h = h;
+    }
+
+    if (pointer_state->scroll_lock == SCROLL_LOCK_VERTICAL || pointer_state->scroll_lock == SCROLL_LOCK_OFF) {
+        mouse_report->v = v;
+    }
+}
+
+static hk_cursor_mode hk_get_cursor_mode(bool side_peripheral) {
+    return side_peripheral ? g_hk_state.peripheral.cursor_mode : g_hk_state.main.cursor_mode;
+}
+
+static hk_cursor_mode hk_get_dragscroll(bool side_peripheral) {
+    return side_peripheral ? g_hk_state.peripheral.drag_scroll : g_hk_state.main.drag_scroll;
+}
+
+static void hk_set_cursor_mode(hk_cursor_mode target_mode, bool enabled, bool side_peripheral) {
+    hk_pointer_state_t* state = side_peripheral ? &g_hk_state.peripheral : &g_hk_state.main;
+    if (enabled) {
+        state->cursor_mode = target_mode;
+    } else {
+        state->cursor_mode = CURSOR_MODE_DEFAULT;
+    }
+
+    // Sniping toggles the active CPI between the default and sniping values.
+    hk_apply_sensitivity(state, side_peripheral);
+    g_hk_state.dirty = true;
+}
+
+static void hk_set_dragscroll(bool enabled, bool side_peripheral) {
+    hk_pointer_state_t* state = side_peripheral ? &g_hk_state.peripheral : &g_hk_state.main;
+    state->drag_scroll = enabled;
+    g_hk_state.dirty = true;
+}
+
+// Sets drag-scroll on both halves at once. Intended for a layer hook that puts
+// the ball(s) into scroll mode while a layer is held (keyball parity), so it
+// works regardless of which side the ball is on. Like HK_D_MODE it overrides the
+// persistent drag_scroll while active.
+void hk_set_dragscroll_both(bool enabled) {
+    hk_set_dragscroll(enabled, /*side_peripheral=*/false);
+    hk_set_dragscroll(enabled, /*side_peripheral=*/true);
+}
+
+static float scale_movement(const hk_pointer_state_t* state, int32_t amount) {
+    if (uses_hw_cpi(state->pointer_kind)) {
+        // The sensor already scaled the motion by its CPI, so pass it through.
+        return amount;
+    }
+
+    float sensitivity = 1;
+    switch (state->cursor_mode) {
+        case CURSOR_MODE_DEFAULT:
+            sensitivity = state->pointer_default_sensitivity;
+            break;
+        case CURSOR_MODE_SNIPING:
+            sensitivity = state->pointer_sniping_sensitivity;
+            break;
+    }
+
+    return amount * sensitivity;
+}
+
+// Pushes the active sensitivity to a hardware-CPI sensor. Event-driven: call on
+// sensitivity change, cursor-mode (sniping) change, and init — never per report.
+// A no-op for software-scaled devices (those apply sensitivity in scale_movement).
+// Master-only: it sets the local sensor directly and stages the peripheral's CPI
+// via pointing_device_set_cpi_on_side, which the split sync forwards.
+static void hk_apply_sensitivity(const hk_pointer_state_t* state, bool side_peripheral) {
+#if defined(SPLIT_POINTING_ENABLE) && defined(POINTING_DEVICE_COMBINED)
+    if (!uses_hw_cpi(state->pointer_kind)) {
+        return;
+    }
+    float cpi = (state->cursor_mode == CURSOR_MODE_SNIPING) ? state->pointer_sniping_sensitivity : state->pointer_default_sensitivity;
+    // main is this hand; peripheral is the other hand.
+    bool left = side_peripheral ? !is_keyboard_left() : is_keyboard_left();
+    pointing_device_set_cpi_on_side(left, (uint16_t)cpi);
+#else
+    (void)state;
+    (void)side_peripheral;
+#endif
+}
+
+static void hk_apply_sensitivity_all(void) {
+    hk_apply_sensitivity(&g_hk_state.main, /*side_peripheral=*/false);
+    hk_apply_sensitivity(&g_hk_state.peripheral, /*side_peripheral=*/true);
+}
+
+// Pushes the loaded auto-mouse settings into QMK's auto_mouse. Call at init.
+static void hk_apply_aml(void) {
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+    set_auto_mouse_enable(hk_eeprom_config.aml_enable);
+    set_auto_mouse_timeout(hk_eeprom_config.aml_timeout);
+#endif
+}
+
+static float hk_pointer_sensitivity_step(const hk_pointer_state_t* state) {
+    switch (state->pointer_kind) {
+        case POINTER_KIND_PMW3360:
+            // Sensitivity is hardware CPI; step by the sensor's CPI granularity
+            // (PMW33XX_CPI_STEP == 100).
+            return 100;
+        case POINTER_KIND_PIMORONI_TRACKBALL:
+            return .1;
+        case POINTER_KIND_TRACKPOINT:
+            return .1;
+        case POINTER_KIND_CIRQUE35:
+            return .1;
+        case POINTER_KIND_CIRQUE40:
+            return .1;
+        case POINTER_KIND_TPS43:
+        case POINTER_KIND_TPS65:
+            return .1;
+        default:
+            // Should never happen
+            return 0;
+    }
+}
+
+static void hk_cycle_pointer_default_sensitivity(bool forward, bool side_peripheral) {
+    hk_pointer_state_t* state = side_peripheral ? &g_hk_state.peripheral : &g_hk_state.main;
+    float step = hk_pointer_sensitivity_step(state);
+    float new_value = forward ? state->pointer_default_sensitivity + step : state->pointer_default_sensitivity - step;
+    if (new_value > 0) {
+        state->pointer_default_sensitivity = new_value;
+        hk_apply_sensitivity(state, side_peripheral);
+        g_hk_state.dirty = true;
+    }
+}
+
+static void hk_cycle_pointer_sniping_sensitivity(bool forward, bool side_peripheral) {
+    hk_pointer_state_t* state = side_peripheral ? &g_hk_state.peripheral : &g_hk_state.main;
+    float step = hk_pointer_sensitivity_step(state);
+    float new_value = forward ? state->pointer_sniping_sensitivity + step : state->pointer_sniping_sensitivity - step;
+    if (new_value > 0) {
+        state->pointer_sniping_sensitivity = new_value;
+        hk_apply_sensitivity(state, side_peripheral);
+        g_hk_state.dirty = true;
+    }
+}
+
+static void hk_cycle_pointer_scroll_throttle(bool forward, bool side_peripheral) {
+    hk_pointer_state_t* state = side_peripheral ? &g_hk_state.peripheral : &g_hk_state.main;
+    // The ends have to be checked before stepping: the value is unsigned, so
+    // 0 - 1 wraps to 255 (a divisor that large stops scrolling outright) and
+    // 255 + 1 back to 0. 0 is a valid setting and means no throttling at all.
+    if (forward ? state->pointer_scroll_throttle == UINT8_MAX : state->pointer_scroll_throttle == 0) {
+        return;
+    }
+    state->pointer_scroll_throttle = forward ? state->pointer_scroll_throttle + 1 : state->pointer_scroll_throttle - 1;
+    g_hk_state.dirty = true;
+}
+
+static void hk_cycle_scroll_mode(bool side_peripheral) {
+    hk_pointer_state_t* state = side_peripheral ? &g_hk_state.peripheral : &g_hk_state.main;
+    hk_scroll_lock new_mode = state->scroll_lock + 1;
+    if (new_mode > SCROLL_LOCK_VERTICAL) {
+        new_mode = SCROLL_LOCK_OFF;
+    }
+    state->scroll_lock = new_mode;
+    g_hk_state.dirty = true;
+}
+
+static void hk_invert_scroll_direction(bool side_peripheral) {
+    hk_pointer_state_t* state = side_peripheral ? &g_hk_state.peripheral : &g_hk_state.main;
+    state->scroll_direction_inverted = !state->scroll_direction_inverted;
+    g_hk_state.dirty = true;
+}
+
+void hk_process_mouse_report(const hk_pointer_state_t* pointer_state, report_mouse_t* mouse_report) {
+    #ifdef ENABLE_DRIFT_DETECTION
+        #ifndef POINTING_DEVICE_CONFIGURATION_TRACKPOINT
+            #error "cannot use ENABLE_DRIFT_DETECTION without a trackpoint"
+        #endif
+
+        drift_detection(&mouse_report);
+    #endif
+
+    #ifdef ENABLE_PIMORONI_ADAPTIVE_MOTION
+        #ifndef POINTING_DEVICE_CONFIGURATION_TRACKBALL
+            #error "cannot use ENABLE_PIMORONI_ADAPTIVE_MOTION without a pimoroni trackball"
+        #endif
+
+        pimoroni_adaptive_motion(&mouse_report);
+    #endif
+
+    // rounding carry to recycle dropped floats from int mouse reports, to smoothen low speed movements (credit
+    // @ankostis)
+    static float rounding_carry_x = 0;
+    static float rounding_carry_y = 0;
+
+    // Reset carry when pointer swaps direction, to follow user's hand.
+    if (mouse_report->x * rounding_carry_x < 0) rounding_carry_x = 0;
+    if (mouse_report->y * rounding_carry_y < 0) rounding_carry_y = 0;
+
+    // First, scale the mouse movement.
+    const report_mouse_t mouse_report_copy = *mouse_report;
+    const float new_x = scale_movement(pointer_state, mouse_report->x) + rounding_carry_x;
+    const float new_y = scale_movement(pointer_state, mouse_report->y) + rounding_carry_y;
+
+    // Accumulate any difference from next integer (quantization).
+    rounding_carry_x = new_x - (int)new_x;
+    rounding_carry_y = new_y - (int)new_y;
+
+    // Clamp values.
+    const mouse_xy_report_t x = CONSTRAIN_XY(new_x);
+    const mouse_xy_report_t y = CONSTRAIN_XY(new_y);
+    bool debug_mouse_report = false;
+    if (x != 0 || y != 0 || mouse_report->v != 0 || mouse_report->h != 0) {
+        debug_mouse_report = true;
+    }
+    mouse_report->x = x;
+    mouse_report->y = y;
+
+    hk_process_scroll(pointer_state, mouse_report);
+
+    if (debug_mouse_report) {
+        debug_hk_mouse_report("before", &mouse_report_copy);
+        debug_hk_mouse_report(" after", mouse_report);
+    }
+    g_hk_state.dirty = true;
+}
+
+#ifdef POINTING_DEVICE_ENABLE
+
+// Encoder scroll (HK_ENCODER_SCROLL_UP/DOWN).
+//
+// A rotary wheel bound to mousekey's MS_WHLU/MS_WHLD scrolls badly for two
+// reasons: mousekey sends one whole line per detent (the coarsest step there
+// is, so hires scrolling buys the encoder nothing), and encoder_map brackets
+// every detent with two ENCODER_MAP_KEY_DELAY waits that block the main loop —
+// matrix scan, pointing device and OLED included — while the wheel spins.
+//
+// So a detent only adds to this accumulator, and the pointing-device task
+// drains a fraction of it into each report: the line goes out as a run of
+// sub-line steps that the host can smooth, and nothing waits on anything.
+// Ball scroll settings don't apply here — the scroll throttle, scroll lock and
+// inversion all belong to ball travel; the wheel's direction is its keymap
+// entry (or, for a mirrored footprint, its pin_a/pin_b order).
+
+// Lines of scroll per detent, before acceleration.
+#ifndef HK_ENCODER_SCROLL_LINES
+#    define HK_ENCODER_SCROLL_LINES 1
+#endif
+
+// How much of the outstanding scroll is emitted per pointing-device report:
+// 1/2^shift of it. Larger spreads a detent over more reports (smoother, but
+// more tail after the wheel stops).
+#ifndef HK_ENCODER_SCROLL_DRAIN_SHIFT
+#    define HK_ENCODER_SCROLL_DRAIN_SHIFT 3
+#endif
+
+// Acceleration: detents arriving less than HK_ENCODER_SCROLL_ACCEL_MS apart
+// scale up, linearly, to HK_ENCODER_SCROLL_ACCEL_MAX times a lone detent. Set
+// the max to 1 to scroll a fixed amount per detent.
+#ifndef HK_ENCODER_SCROLL_ACCEL_MAX
+#    define HK_ENCODER_SCROLL_ACCEL_MAX 3
+#endif
+#ifndef HK_ENCODER_SCROLL_ACCEL_MS
+#    define HK_ENCODER_SCROLL_ACCEL_MS 100
+#endif
+
+// Scroll owed to the host, in the unit the report speaks: sub-line hires units
+// when hires scrolling is on, whole lines otherwise. Positive is up.
+static int32_t hk_encoder_scroll_pending = 0;
+
+static int32_t hk_encoder_scroll_units_per_line(void) {
+#ifdef POINTING_DEVICE_HIRES_SCROLL_ENABLE
+    return pointing_device_get_hires_scroll_resolution();
+#else
+    return 1;
+#endif
+}
+
+static void hk_encoder_scroll(bool up) {
+    const int32_t units = hk_encoder_scroll_units_per_line() * HK_ENCODER_SCROLL_LINES;
+    int32_t       step  = units;
+
+#if HK_ENCODER_SCROLL_ACCEL_MAX > 1
+    static uint32_t last_detent = 0;
+
+    const uint32_t gap = timer_elapsed32(last_detent);
+    if (gap < HK_ENCODER_SCROLL_ACCEL_MS) {
+        step += (units * (HK_ENCODER_SCROLL_ACCEL_MAX - 1) * (int32_t)(HK_ENCODER_SCROLL_ACCEL_MS - gap)) / HK_ENCODER_SCROLL_ACCEL_MS;
+    }
+    last_detent = timer_read32();
+#endif
+
+    hk_encoder_scroll_pending += up ? step : -step;
+}
+
+static void hk_encoder_scroll_drain(report_mouse_t* mouse_report) {
+    if (hk_encoder_scroll_pending == 0) {
+        return;
+    }
+
+    const int32_t remaining = hk_encoder_scroll_pending;
+    const int32_t magnitude = remaining < 0 ? -remaining : remaining;
+
+    // Draining a fraction rather than a fixed amount keeps both ends honest: a
+    // lone detent tapers off over a handful of reports, while the backlog from
+    // a fast spin empties proportionally faster, so the scroll never falls
+    // behind the wheel.
+    int32_t min_step = hk_encoder_scroll_units_per_line() >> HK_ENCODER_SCROLL_DRAIN_SHIFT;
+    if (min_step < 1) {
+        min_step = 1;
+    }
+
+    int32_t step = magnitude >> HK_ENCODER_SCROLL_DRAIN_SHIFT;
+    if (step < min_step) {
+        step = min_step;
+    }
+    if (step > magnitude) {
+        step = magnitude;
+    }
+    if (remaining < 0) {
+        step = -step;
+    }
+
+    hk_encoder_scroll_pending -= step;
+    mouse_report->v = CONSTRAIN_HV((int32_t)mouse_report->v + step);
+}
+
+#else // POINTING_DEVICE_ENABLE
+
+// No pointing-device report to ride on; the keycodes fall back to mousekey.
+static inline void hk_encoder_scroll_drain(report_mouse_t* mouse_report) {
+    (void)mouse_report;
+}
+
+#endif // POINTING_DEVICE_ENABLE
+
+#if defined(SPLIT_POINTING_ENABLE) && defined(POINTING_DEVICE_COMBINED)
+
+report_mouse_t pointing_device_task_combined_user(report_mouse_t left_report, report_mouse_t right_report) {
+    // pointing_device_task_* is entered only on the main side, ensure that.
+    if (!g_hk_state.is_main_side) {
+        report_mouse_t report = pointing_device_combine_reports(left_report, right_report);
+        return pointing_device_task_combined_keymap(report);
+    }
+
+    // Use is_keyboard_left to know which report is main and which is peripheral.
+    hk_process_mouse_report(&g_hk_state.main, is_keyboard_left() ? &left_report : &right_report);
+    hk_process_mouse_report(&g_hk_state.peripheral, is_keyboard_left() ? &right_report : &left_report);
+
+    report_mouse_t report = pointing_device_combine_reports(left_report, right_report);
+    hk_encoder_scroll_drain(&report);
+    g_hk_state.display.last_mouse = report;
+    return pointing_device_task_combined_keymap(report);
+}
+
+#else
+
+report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
+    // pointing_device_task_* is entered only on the main side, ensure that.
+    if (!g_hk_state.is_main_side) {
+        return pointing_device_task_keymap(mouse_report);
+    }
+
+    hk_process_mouse_report(&g_hk_state.main, &mouse_report);
+    hk_encoder_scroll_drain(&mouse_report);
+    g_hk_state.display.last_mouse = mouse_report;
+
+    return pointing_device_task_keymap(mouse_report);
+}
+
+#endif
+
+// clang-format off
+const char PROGMEM code_to_name[] = {
+    'a', 'b', 'c', 'd', 'e', 'f',  'g', 'h', 'i',  'j',
+    'k', 'l', 'm', 'n', 'o', 'p',  'q', 'r', 's',  't',
+    'u', 'v', 'w', 'x', 'y', 'z',  '1', '2', '3',  '4',
+    '5', '6', '7', '8', '9', '0',  'R', 'E', 'B',  'T',
+    '_', '-', '=', '[', ']', '\\', '#', ';', '\'', '`',
+    ',', '.', '/',
+};
+// clang-format on
+
+static void pressing_keys_update(uint16_t keycode, keyrecord_t *record) {
+    // Process only valid keycodes.
+    if (keycode >= 4 && keycode < 57) {
+        char value = pgm_read_byte(code_to_name + keycode - 4);
+        char where = BL;
+        if (!record->event.pressed) {
+            // Swap `value` and `where` when releasing.
+            where = value;
+            value = BL;
+        }
+        // Rewrite the last `where` of pressing_keys to `value` .
+        for (int i = 0; i < HK_OLED_MAX_PRESSING_KEYCODES; i++) {
+            if (g_hk_state.display.pressing_keys[i] == where) {
+                g_hk_state.display.pressing_keys[i] = value;
+                break;
+            }
+        }
+    }
+    g_hk_state.dirty = true;
+}
+
+bool process_record_user(uint16_t keycode, keyrecord_t* record) {
+    if (!g_hk_state.is_main_side) {
+        return process_record_keymap(keycode, record);
+    }
+
+    g_hk_state.dirty = true;
+    g_hk_state.display.last_kc = keycode;
+    g_hk_state.display.last_pos = record->event.key;
+    pressing_keys_update(keycode, record);
+
+    if (!process_record_keymap(keycode, record)) {
+        return false;
+    }
+
+    bool propagate_event = true;
+    bool state_changed = false;
+
+    switch (keycode) {
+        case HK_SAVE_SETTINGS:
+            if (record->event.pressed) {
+                write_eeconfig();
+            }
+            break;
+        case HK_RESET_SETTINGS:
+            if (record->event.pressed) {
+                g_hk_state = init_state();
+                hk_apply_sensitivity_all();
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+                set_auto_mouse_enable(true);
+                set_auto_mouse_timeout(AUTO_MOUSE_TIME);
+#endif
+                write_eeconfig();
+            }
+            break;
+        case HK_DUMP_SETTINGS:
+            if (record->event.pressed) {
+                debug_hk_state_to_console(&g_hk_state);
+            }
+            break;
+        case KC_UP:
+        case KC_DOWN:
+            if (!g_hk_state.setting_default_sensitivity && !g_hk_state.setting_sniping_sensitivity && !g_hk_state.setting_scroll_throttle) {
+                break;
+            }
+            if (record->event.pressed) {
+                if (g_hk_state.setting_default_sensitivity) {
+                    hk_cycle_pointer_default_sensitivity(/*forward=*/keycode == KC_UP, /*side_peripheral=*/hk_target_side_peripheral());
+                }
+                else if (g_hk_state.setting_sniping_sensitivity) {
+                    hk_cycle_pointer_sniping_sensitivity(/*forward=*/keycode == KC_UP, /*side_peripheral=*/hk_target_side_peripheral());
+                }
+                else if (g_hk_state.setting_scroll_throttle) {
+                    hk_cycle_pointer_scroll_throttle(/*forward=*/keycode == KC_UP, /*side_peripheral=*/hk_target_side_peripheral());
+                }
+                propagate_event = false;
+                state_changed = true;
+            }
+            break;
+        case HK_POINTER_SET_DEFAULT_SENSITIVITY:
+            g_hk_state.setting_default_sensitivity = record->event.pressed;
+            // state_changed = true;
+            break;
+        case HK_POINTER_SET_SNIPING_SENSITIVITY:
+            g_hk_state.setting_sniping_sensitivity = record->event.pressed;
+            // state_changed = true;
+            break;
+        case HK_POINTER_SET_SCROLL_THROTTLE:
+            g_hk_state.setting_scroll_throttle = record->event.pressed;
+            // state_changed = true;
+            break;
+        case HK_SNIPING_MODE: {
+            // Latch the shift-selected side at press: sampling it again at release
+            // would toggle the other half whenever shift changed mid-hold (e.g.
+            // shift-clicking while sniping, or releasing shift before the key when
+            // targeting the peripheral), leaving the pressed side stuck in the mode.
+            static bool snipe_side_peripheral = false;
+            if (record->event.pressed) {
+                snipe_side_peripheral = hk_target_side_peripheral();
+            }
+            hk_set_cursor_mode(/*mode=*/CURSOR_MODE_SNIPING, /*enabled=*/record->event.pressed, /*side_peripheral=*/snipe_side_peripheral);
+            state_changed = true;
+            break;
+        }
+        case HK_SNIPING_MODE_TOGGLE:
+            if (record->event.pressed) {
+                bool is_on = hk_get_cursor_mode(/*side_peripheral=*/hk_target_side_peripheral()) == CURSOR_MODE_SNIPING;
+                hk_set_cursor_mode(/*mode=*/CURSOR_MODE_SNIPING, /*enabled=*/!is_on, /*side_peripheral=*/hk_target_side_peripheral());
+                state_changed = true;
+            }
+            break;
+        case HK_DRAGSCROLL_MODE: {
+            // Same press-time latch as HK_SNIPING_MODE above.
+            static bool dragscroll_side_peripheral = false;
+            if (record->event.pressed) {
+                dragscroll_side_peripheral = hk_target_side_peripheral();
+            }
+            hk_set_dragscroll(/*enabled=*/record->event.pressed, /*side_peripheral=*/dragscroll_side_peripheral);
+            state_changed = true;
+            break;
+        }
+        case HK_DRAGSCROLL_MODE_TOGGLE:
+            if (record->event.pressed) {
+                bool is_on = hk_get_dragscroll(/*side_peripheral=*/hk_target_side_peripheral());
+                hk_set_dragscroll(/*enabled=*/!is_on, /*side_peripheral=*/hk_target_side_peripheral());
+                state_changed = true;
+            }
+            break;
+        case HK_CYCLE_SCROLL_LOCK:
+            if (record->event.pressed) {
+                hk_cycle_scroll_mode(/*side_peripheral=*/hk_target_side_peripheral());
+                state_changed = true;
+            }
+            break;
+        case HK_INVERT_SCROLL_DIRECTION:
+            if (record->event.pressed) {
+                hk_invert_scroll_direction(/*side_peripheral=*/hk_target_side_peripheral());
+                state_changed = true;
+            }
+            break;
+
+        case HK_ENCODER_SCROLL_UP:
+        case HK_ENCODER_SCROLL_DOWN:
+            if (record->event.pressed) {
+#ifdef POINTING_DEVICE_ENABLE
+                hk_encoder_scroll(/*up=*/keycode == HK_ENCODER_SCROLL_UP);
+#elif defined(MOUSEKEY_ENABLE)
+                tap_code16(keycode == HK_ENCODER_SCROLL_UP ? MS_WHLU : MS_WHLD);
+#endif
+            }
+            propagate_event = false;
+            break;
+
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+        case HK_AUTO_MOUSE_TOGGLE:
+            if (record->event.pressed) {
+                set_auto_mouse_enable(!get_auto_mouse_enable());
+            }
+            break;
+        case HK_AUTO_MOUSE_TIMEOUT_UP:
+            if (record->event.pressed) {
+                uint16_t t = get_auto_mouse_timeout() + 50;
+                set_auto_mouse_timeout(t > 2550 ? 2550 : t);
+            }
+            break;
+        case HK_AUTO_MOUSE_TIMEOUT_DOWN:
+            if (record->event.pressed) {
+                uint16_t t = get_auto_mouse_timeout();
+                set_auto_mouse_timeout(t >= 100 ? t - 50 : 50);
+            }
+            break;
+#endif
+
+#ifdef HK_BONGO_ENABLE
+        case HK_BONGO_TOGGLE:
+            if (record->event.pressed) {
+                // Shift targets the peripheral half's OLED, like the pointing
+                // config keycodes. The OLED gets wiped on the render side when the
+                // mode changes (the master can't clear the peripheral's OLED from
+                // here anyway), so just flip the flag and let the sync carry it.
+                if (has_shift_mod()) {
+                    g_hk_state.display.show_bongo_peripheral = !g_hk_state.display.show_bongo_peripheral;
+                } else {
+                    g_hk_state.display.show_bongo_main = !g_hk_state.display.show_bongo_main;
+                }
+                state_changed = true;
+            }
+            break;
+#endif
+
+    }
+    if (state_changed) {
+        debug_hk_state_to_console(&g_hk_state);
+        // write_eeconfig();
+    }
+    return propagate_event;
+}
+
+__attribute__((weak)) void keyboard_post_init_keymap(void) {}
+
+__attribute__((weak)) void hk_pointing_devices_detected_keymap(bool left_has_pointing, bool right_has_pointing) {
+    (void)left_has_pointing;
+    (void)right_has_pointing;
+}
+
+#ifdef HK_SPLIT_DETECT_POINTING
+#define HK_DETECT_POINTING_INTERVAL 500
+#define HK_DETECT_POINTING_MAXTRY 10
+
+// Master-side: pull the peripheral's pointing-device presence over a split RPC,
+// retrying until it answers (it may not be up at boot). Once known, combine it
+// with this side's own status and hand the left/right result to the keymap. Runs
+// once; mirrors the keyball KEYBALL_GET_INFO negotiation.
+static void hk_detect_pointing_invoke(void) {
+    static bool     negotiated = false;
+    static uint32_t last       = 0;
+    static int      round      = 0;
+    if (negotiated || timer_elapsed32(last) < HK_DETECT_POINTING_INTERVAL) {
+        return;
+    }
+    last = timer_read32();
+    round++;
+
+    hk_pointing_info_t recv = {0};
+    if (!transaction_rpc_exec(HK_GET_POINTING_INFO, 0, NULL, sizeof(recv), &recv)) {
+        if (round < HK_DETECT_POINTING_MAXTRY) {
+            printf("hk_detect_pointing_invoke: missed #%d\n", round);
+            return;
+        }
+        printf("hk_detect_pointing_invoke: giving up after #%d, assuming peripheral has no pointing device\n", round);
+    }
+    negotiated = true;
+
+    bool this_have  = hk_local_pointing_present();
+    bool that_have  = recv.have_pointing;
+    bool left_have  = is_keyboard_left() ? this_have : that_have;
+    bool right_have = is_keyboard_left() ? that_have : this_have;
+    printf("hk_detect_pointing_invoke: negotiated #%d left=%d right=%d\n", round, left_have, right_have);
+    hk_pointing_devices_detected_keymap(left_have, right_have);
+}
+#endif
+
+void housekeeping_task_user(void) {
+#if defined(SPLIT_POINTING_ENABLE) && defined(POINTING_DEVICE_COMBINED)
+    // Both QMK bases re-probe a local sensor that failed init for a short
+    // window after boot (pointing_device_retry_init). A sensor that only
+    // answers on one of those retries missed the CPI push in
+    // keyboard_post_init_user and would run at the driver's compile-time
+    // default, so push it again the first time the sensor is seen. A no-op for
+    // devices whose sensitivity is a software multiplier.
+    if (is_keyboard_master()) {
+        static bool local_pointing_seen = false;
+        if (!local_pointing_seen && hk_local_pointing_present()) {
+            local_pointing_seen = true;
+            hk_apply_sensitivity_all();
+        }
+    }
+#endif
+
+#ifdef HK_SPLIT_DETECT_POINTING
+    if (is_keyboard_master()) {
+        hk_detect_pointing_invoke();
+        hk_update_active_side();
+    }
+#endif
+
+#ifdef HK_SPLIT_SYNC_STATE
+    if (is_keyboard_master()) {
+        static uint32_t last_sync = 0;
+        if (timer_elapsed32(last_sync) > 100 && g_hk_state.dirty) {
+            if (transaction_rpc_send(HK_SYNC_STATE, sizeof(g_hk_state), &g_hk_state)) {
+                g_hk_state.dirty = false;
+                last_sync = timer_read32();
+            } else {
+                printf("housekeeping_task_user: failed to send HK_SYNC_STATE rpc\n");
+            }
+        }
+    }
+#endif
+
+
+#if defined(HK_PIMORONI_TRACKBALL_RGB_RAINBOW) && defined(POINTING_DEVICE_DRIVER_pimoroni_trackball)
+    bool run_animation = false;
+
+    // With two trackballs, always run the animation.
+    #if defined(HK_POINTING_DEVICE_LEFT_PIMORONI) && defined(HK_POINTING_DEVICE_RIGHT_PIMORONI)
+        run_animation = true;
+    #elif defined(HK_POINTING_DEVICE_LEFT_PIMORONI)
+        run_animation = is_keyboard_left();
+    #elif defined(HK_POINTING_DEVICE_RIGHT_PIMORONI)
+        run_animation = !is_keyboard_left();
+    #else
+        #error "HK_PIMORONI_TRACKBALL_RGB_RAINBOW requires a pimoroni on either sides."
+    #endif
+
+    if (run_animation) {
+        static uint32_t timer = 0;
+        static HSV color = { .h = 0, .s = 255, .v = 255 };
+
+        if (timer_elapsed32(timer) < 400)
+            return;
+
+        timer = timer_read32();
+
+        // increase hue -> change color
+        color.h++;
+
+        RGB rgb = hsv_to_rgb(color);
+        pimoroni_trackball_set_rgbw(rgb.r, rgb.g, rgb.b, 0);
+    }
+#endif
+}
+
+void keyboard_post_init_user(void) {
+    if (!is_keyboard_master()) {
+        #ifdef HK_SPLIT_SYNC_STATE
+            transaction_register_rpc(HK_SYNC_STATE, hk_rpc_sync_state);
+        #endif
+        #ifdef HK_SPLIT_DETECT_POINTING
+            transaction_register_rpc(HK_GET_POINTING_INFO, hk_rpc_get_pointing_info);
+        #endif
+
+        keyboard_post_init_keymap();
+        return;
+    }
+
+    // The pointer kinds this firmware actually has are needed to validate the
+    // saved block below, so build the default state first either way.
+    g_hk_state = init_state();
+
+    // Reads zeros when the block was never written or was written under a
+    // different EECONFIG_USER_DATA_VERSION, which core checks against the
+    // version it keeps outside the block.
+    eeconfig_read_user_datablock(&hk_eeprom_config, 0, sizeof(hk_eeprom_config_t));
+    if (!eeconfig_is_user_datablock_valid()) {
+        printf("keyboard_post_init_user: no saved settings for schema %u, initializing\n", (unsigned)EECONFIG_USER_DATA_VERSION);
+        eeconfig_init_user();
+    } else if (hk_eeprom_config.pointing.main_pointer_kind != g_hk_state.main.pointer_kind || hk_eeprom_config.pointing.peripheral_pointer_kind != g_hk_state.peripheral.pointer_kind) {
+        // Saved under a different pointing configuration (a different
+        // POINTING_DEVICE build was flashed before this one). Its per-side
+        // settings describe the wrong hardware, and a side that had no device
+        // saved a sensitivity of 0 - keeping that would multiply this side's
+        // motion to nothing, so start from this configuration's defaults.
+        printf("keyboard_post_init_user: eeprom saved for a different pointing configuration (main %s, peripheral %s), resetting to defaults\n",
+                hk_pointer_kind_to_string(hk_eeprom_config.pointing.main_pointer_kind), hk_pointer_kind_to_string(hk_eeprom_config.pointing.peripheral_pointer_kind));
+        eeconfig_init_user();
+    } else {
+        deserialize_eeconfig_to_state(&hk_eeprom_config);
+        debug_hk_state_to_console(&g_hk_state);
+    }
+
+    // Push the loaded/initial sensitivity to any hardware-CPI sensor (both sides),
+    // and the loaded auto-mouse settings into QMK's auto_mouse.
+    hk_apply_sensitivity_all();
+    hk_apply_aml();
+
+#if (defined(HK_POINTING_DEVICE_LEFT_TRACKPOINT) || defined(HK_POINTING_DEVICE_RIGHT_TRACKPOINT)) && defined(OLED_ENABLE)
+    // The trackpoint's PS/2 pins double as the OLED's I2C bus (GP2/GP3 on the
+    // Pro Micro RP2040 footprint). When PS/2 init fails - no trackpoint on this
+    // half, i.e. USB is in the wrong half - ps2_mouse_init tears the PS/2 host
+    // driver down and releases the pins; hand them back to I2C here so the OLED
+    // (already initialized before the pins were taken) resumes working and can
+    // show the wrong-half marquee.
+    if (!hk_local_pointing_present()) {
+        palSetLineMode(I2C1_SDA_PIN, I2C1_SDA_PAL_MODE);
+        palSetLineMode(I2C1_SCL_PIN, I2C1_SCL_PAL_MODE);
+    }
+#endif
+
+    keyboard_post_init_keymap();
+}
+
+__attribute__((weak)) void eeconfig_init_keymap(void) {}
+void                       eeconfig_init_user(void) {
+    g_hk_state = init_state();
+    debug_hk_state_to_console(&g_hk_state);
+
+    // Zero the whole block, not just the fields serialize writes, so the unused
+    // tail doesn't carry over whatever the previous schema left there.
+    memset(&hk_eeprom_config, 0, sizeof(hk_eeprom_config_t));
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+    // Default the auto-mouse layer on — QMK leaves it off, so a board that enables
+    // the feature would otherwise never auto-activate the mouse layer. serialize
+    // below then captures this default into the eeprom block.
+    set_auto_mouse_enable(true);
+    set_auto_mouse_timeout(AUTO_MOUSE_TIME);
+#endif
+    serialize_state_to_eeconfig(&hk_eeprom_config);
+
+    eeconfig_init_keymap();
+    eeconfig_update_user_datablock(&hk_eeprom_config, 0, sizeof(hk_eeprom_config_t));
+
+    printf("eeconfig_init_user: eeprom data written\n");
+}
