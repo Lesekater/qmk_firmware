@@ -184,3 +184,56 @@ bool caps_word_press_user(uint16_t keycode) {
   }
 }
 #endif  // CAPS_WORD_ENABLE
+
+#ifdef OLED_ENABLE
+bool oled_task_user(void) {
+    // Host Keyboard Layer Status
+    oled_write_P(PSTR("Layer: "), false);
+
+    switch (get_highest_layer(layer_state)) {
+        case BASE:
+            oled_write_P(PSTR("Base\n"), false);
+            break;
+        case NUM:
+            oled_write_P(PSTR("Numbers\n"), false);
+            break;
+        case SYM:
+            oled_write_P(PSTR("Symbol\n"), false);
+            break;
+        case ADJUST:
+            oled_write_P(PSTR("Adjust\n"), false);
+            break;
+        case MOUSE:
+            oled_write_P(PSTR("Mouse\n"), false);
+            break;
+        case MUGGLE:
+            oled_write_P(PSTR("Muggle\n"), false);
+            break;
+        default:
+            // Or use the write_ln shortcut over adding '\n' to the end of your string
+            oled_write_ln_P(PSTR("Undefined"), false);
+    }
+
+    return false;
+}
+
+void oled_render_boot(bool bootloader) {
+    oled_clear();
+    for (int i = 0; i < 16; i++) {
+        oled_set_cursor(0, i);
+        if (bootloader) {
+            oled_write_P(PSTR("Awaiting New Firmware "), false);
+        } else {
+            oled_write_P(PSTR("Rebooting "), false);
+        }
+    }
+
+    oled_render_dirty(true);
+}
+
+bool shutdown_user(bool jump_to_bootloader) {
+    oled_render_boot(jump_to_bootloader);
+
+    return true;
+}
+#endif
