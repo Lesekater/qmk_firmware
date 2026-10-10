@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include QMK_KEYBOARD_H
 #include "users/holykeebs/holykeebs.h"
+#include "users/holykeebs/bongocat.h"
 #include "keymap_german.h"
 
 #define QK_C_EEPROM QK_CLEAR_EEPROM
@@ -47,9 +48,19 @@ enum keycode_aliases {
   //NAV_EQL = LT(0, KC_EQL),
 };
 
-// TEMPORARY A ON MOD (A key broken)
+// Layer Declarations
+enum {
+    BASE   = 0,
+    NUM    = 1,
+    SYM    = 2,
+    ADJUST = 3,
+    MOUSE  = 4,
+    MUGGLE = 5,
+};
+
+// Keymaps
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
-  [0] = LAYOUT_split_3x6_3(
+  [BASE] = LAYOUT_split_3x6_3(
   //,-----------------------------------------------------.                    ,---------------------------------------------------------.
        KC_TAB,    KC_Q,    KC_W,    KC_E,    KC_R,    KC_T,                         KC_Y,    KC_U,    KC_I,    KC_O,   KC_P,  KC_LBRC,
   //|--------+--------+--------+--------+--------+--------|                    |--------+--------+--------+--------+--------+------------|
@@ -57,13 +68,13 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
   //|--------+--------+--------+--------+--------+--------|                    |--------+--------+--------+--------+--------+------------|
       KC_LSFT,    KC_Z,    KC_X,    KC_C,    KC_V,    KC_B,                         KC_N,    KC_M, KC_COMM,  KC_DOT, KC_SLSH,  KC_NUHS,
   //|--------+--------+--------+--------+--------+--------+--------|  |--------+--------+--------+--------+--------+--------+------------|
-                                           TT(4) , TL_LOWR,  KC_SPC,     KC_ENT, TL_UPPR, KC_BSPC
+                                           TT(MOUSE) , TL_LOWR,  KC_SPC,     KC_ENT, TL_UPPR, KC_BSPC
                                       //`--------------------------'  `--------------------------'
 
   ),
 
   // "lower" Layer - NUM
-  [1] = LAYOUT_split_3x6_3(
+  [NUM] = LAYOUT_split_3x6_3(
   //,-----------------------------------------------------.                    ,-----------------------------------------------------.
       XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX,  XXXXXXX,                      XXXXXXX,    KC_7,    KC_8,    KC_9, XXXXXXX, XXXXXXX,
   //|--------+--------+--------+--------+--------+--------|                    |--------+--------+--------+--------+--------+--------|
@@ -76,7 +87,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
   ),
 
   // "upper" Layer - SYM
-  [2] = LAYOUT_split_3x6_3(
+  [SYM] = LAYOUT_split_3x6_3(
   //,------------------------------------------------------------.             ,------------------------------------------------------------.
       _______, LSFT(KC_1), LSFT(KC_2), LSFT(KC_3), LSFT(KC_4), LSFT(KC_5),     LSFT(KC_6), LSFT(KC_7), LSFT(KC_8), LSFT(KC_9), LSFT(KC_0), _______, // Shift + 1-0
   //|--------+--------+--------+--------+--------+---------------|             |--------+--------+--------+--------+--------+---------------|
@@ -88,20 +99,20 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
                                       //`--------------------------'  `--------------------------'
   ),
 
-  [3] = LAYOUT_split_3x6_3(
+  [ADJUST] = LAYOUT_split_3x6_3(
   //,------------------------------------------------------------------------------.                   ,-----------------------------------------------------------------------------.
           QK_BOOT,     HK_DUMP,     HK_SAVE,     HK_RESET,     XXXXXXX, HK_C_SCROLL,                         XXXXXXX,     XXXXXXX,     XXXXXXX,     XXXXXXX,     XXXXXXX,     QK_BOOT,
   //|------------+------------+------------+-------------+------------+------------|                   |------------+------------+------------+------------+------------+------------|
       QK_C_EEPROM,  HK_P_SET_D,  HK_P_SET_S, HK_P_SET_THR,     XXXXXXX, HK_S_MODE_T,                         KC_LEFT,    KC_DOWN,        KC_UP,    KC_RIGHT,     XXXXXXX, QK_C_EEPROM,
   //|------------+------------+------------+-------------+------------+------------|                   |------------+------------+------------+------------+------------+------------|
-          KC_LSFT,      KC_F13,      KC_F14,      XXXXXXX,     XXXXXXX, HK_D_MODE_T,                         XXXXXXX,     XXXXXXX,     XXXXXXX,       XXXXXXX,     XXXXXXX,     XXXXXXX,
+          KC_LSFT,      KC_F13,      KC_F14,      XXXXXXX,     XXXXXXX, HK_D_MODE_T,                         XXXXXXX,     XXXXXXX,     XXXXXXX,       XXXXXXX,   XXXXXXX,  HK_BONGO_T,
   //|------------+------------+------------+-------------+------------+------------+--------| |--------+------------+------------+------------+------------+------------+------------|
                                                                KC_LGUI,     _______,  KC_SPC,    KC_ENT,     _______,     KC_RALT
                                                        //`----------------------------------' `----------------------------------'
   ),
 
   // MOUSE
-  [4] = LAYOUT_split_3x6_3(
+  [MOUSE] = LAYOUT_split_3x6_3(
   //,------------------------------------------------------------.             ,------------------------------------------------------------.
       XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX,                      XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX,
   //|--------+--------+--------+--------+--------+---------------|             |--------+--------+--------+--------+--------+---------------|
@@ -112,6 +123,19 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
                                _______, _______,  QK_MOUSE_BUTTON_2,     QK_MOUSE_BUTTON_1, MS_WHLU, MS_WHLD
                                       //`--------------------------'  `--------------------------'
   ),
+
+  // Muggle Mode
+  [MUGGLE] = LAYOUT_split_3x6_3(
+  //,-----------------------------------------------------.                    ,---------------------------------------------------------.
+       KC_TAB,    KC_Q,    KC_W,    KC_E,    KC_R,    KC_T,                         KC_Y,    KC_U,    KC_I,    KC_O,   KC_P,  KC_LBRC,
+  //|--------+--------+--------+--------+--------+--------|                    |--------+--------+--------+--------+--------+------------|
+       KC_ESC,    KC_A,    KC_S,    KC_D,    KC_F,    KC_G,                         KC_H,    KC_J,    KC_K,    KC_L, KC_SCLN, KC_QUOT,
+  //|--------+--------+--------+--------+--------+--------|                    |--------+--------+--------+--------+--------+------------|
+      KC_LSFT,    KC_Z,    KC_X,    KC_C,    KC_V,    KC_B,                         KC_N,    KC_M, KC_COMM,  KC_DOT, KC_SLSH,  KC_NUHS,
+  //|--------+--------+--------+--------+--------+--------+--------|  |--------+--------+--------+--------+--------+--------+------------|
+                                           TT(MOUSE) , TL_LOWR,  KC_SPC,     KC_ENT, TL_UPPR, KC_BSPC
+                                      //`--------------------------'  `--------------------------'
+  ),
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -119,10 +143,12 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 ///////////////////////////////////////////////////////////////////////////////
 const uint16_t bckspc_combo[] PROGMEM = {KC_I, KC_O, COMBO_END};
 const uint16_t tab_combo[]    PROGMEM = {KC_Q, KC_W, COMBO_END};
+const uint16_t muggle_combo[] PROGMEM = {KC_Q, KC_W, KC_E, KC_R, COMBO_END};
 
 combo_t key_combos[] = {
     COMBO(bckspc_combo, KC_BSPC),          // I and O and P => backspace.
     COMBO(tab_combo,    KC_TAB),           // Q and W => tab
+    COMBO(muggle_combo, TG(MUGGLE)),
 };
 
 ///////////////////////////////////////////////////////////////////////////////
