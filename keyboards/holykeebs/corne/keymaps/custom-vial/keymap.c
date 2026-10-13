@@ -120,7 +120,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
   //|--------+--------+--------+--------+--------+--------|                    |--------+--------+--------+--------+--------+---------------|
       XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX,                      XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX,
   //|--------+--------+--------+--------+--------+--------+--------|  |--------+--------+--------+--------+--------+--------+---------------|
-                               _______, _______,  QK_MOUSE_BUTTON_2,     QK_MOUSE_BUTTON_1, MS_WHLU, MS_WHLD
+                               _______, _______,  QK_MOUSE_BUTTON_2,     QK_MOUSE_BUTTON_1, MS_WHLD, MS_WHLU
                                       //`--------------------------'  `--------------------------'
   ),
 
