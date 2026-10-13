@@ -34,7 +34,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Tap-hold configuration for home row mods.
 //#define TAPPING_TERM 240
 //#define TAPPING_TERM_PER_KEY
-//#define FLOW_TAP_TERM 100
+#define FLOW_TAP_TERM 100
 //#define CHORDAL_HOLD
 #define PERMISSIVE_HOLD
 #define SPECULATIVE_HOLD
