@@ -101,11 +101,11 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 
   [ADJUST] = LAYOUT_split_3x6_3(
   //,------------------------------------------------------------------------------.                   ,-----------------------------------------------------------------------------.
-          QK_BOOT,     HK_DUMP,     HK_SAVE,     HK_RESET,     XXXXXXX, HK_C_SCROLL,                         XXXXXXX,     XXXXXXX,     XXXXXXX,     XXXXXXX,     XXXXXXX,     QK_BOOT,
+          QK_BOOT,     XXXXXXX,     XXXXXXX,     XXXXXXX,      XXXXXXX,     XXXXXXX,                         XXXXXXX,     XXXXXXX,     XXXXXXX,     XXXXXXX,     XXXXXXX,     QK_BOOT,
   //|------------+------------+------------+-------------+------------+------------|                   |------------+------------+------------+------------+------------+------------|
-      QK_C_EEPROM,  HK_P_SET_D,  HK_P_SET_S, HK_P_SET_THR,     XXXXXXX, HK_S_MODE_T,                         KC_LEFT,    KC_DOWN,        KC_UP,    KC_RIGHT,     XXXXXXX, QK_C_EEPROM,
+          XXXXXXX,     XXXXXXX,     XXXXXXX,     XXXXXXX,      XXXXXXX,     XXXXXXX,                         KC_LEFT,    KC_DOWN,        KC_UP,    KC_RIGHT,     XXXXXXX,     XXXXXXX,
   //|------------+------------+------------+-------------+------------+------------|                   |------------+------------+------------+------------+------------+------------|
-          KC_LSFT,      KC_F13,      KC_F14,      XXXXXXX,     XXXXXXX, HK_D_MODE_T,                         XXXXXXX,     XXXXXXX,     XXXXXXX,       XXXXXXX,   XXXXXXX,  HK_BONGO_T,
+          KC_LSFT,      KC_F13,      KC_F14,      XXXXXXX,     XXXXXXX,     XXXXXXX,                         XXXXXXX,     XXXXXXX,     XXXXXXX,       XXXXXXX,   XXXXXXX,  HK_BONGO_T,
   //|------------+------------+------------+-------------+------------+------------+--------| |--------+------------+------------+------------+------------+------------+------------|
                                                                KC_LGUI,     _______,  KC_SPC,    KC_ENT,     _______,     KC_RALT
                                                        //`----------------------------------' `----------------------------------'
